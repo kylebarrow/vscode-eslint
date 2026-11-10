@@ -8,7 +8,7 @@ import { EOL } from 'os';
 import {
 	createConnection, Diagnostic, Range, TextDocuments, TextDocumentSyncKind, TextEdit, Command, WorkspaceChange, VersionedTextDocumentIdentifier,
 	DidChangeConfigurationNotification,  CodeAction, CodeActionKind, Position, TextDocumentEdit, Message as LMessage, ResponseMessage as LResponseMessage,
-	uinteger, ServerCapabilities, NotebookDocuments, ProposedFeatures, ClientCapabilities, type FullDocumentDiagnosticReport, DocumentDiagnosticReportKind
+	uinteger, ServerCapabilities, NotebookDocuments, ProposedFeatures, ClientCapabilities, type FullDocumentDiagnosticReport, DocumentDiagnosticReportKind, WorkspaceFolder, WorkspaceEdit
 } from 'vscode-languageserver/node';
 
 import { TextDocument } from 'vscode-languageserver-textdocument';
@@ -18,7 +18,7 @@ import {
 	ExitCalled, OpenESLintDocRequest, Status, StatusNotification
 } from './shared/customMessages';
 
-import { Validate, CodeActionsOnSaveMode } from './shared/settings';
+import { Validate, CodeActionsOnSaveMode, ConfigurationSettings } from './shared/settings';
 
 import {
 	CodeActions, ESLint, ESLintClassOptions, FixableProblem, Fixes, Problem, RuleMetaData, RuleSeverities,
@@ -28,6 +28,7 @@ import {
 import { getFileSystemPath, getUri, isUNC } from './paths';
 import { stringDiff } from './diff';
 import LanguageDefaults from './languageDefaults';
+import { PushDiagnostics } from './pushDiagnostics';
 
 // The connection to use. Code action requests get removed from the queue if
 // canceled.
@@ -51,6 +52,23 @@ const connection: ProposedFeatures.Connection = createConnection(ProposedFeature
 
 // Set when handling the initialize request.
 let clientCapabilities: ClientCapabilities;
+let supportsPullDiagnostics = false;
+let workspaceFolders: WorkspaceFolder[] = [];
+let initializationSettings: Partial<ConfigurationSettings> = {};
+
+/** Resolve standalone settings per document without changing the VS Code settings contract. */
+async function getConfiguration(document: TextDocument): Promise<Partial<ConfigurationSettings> | null | undefined> {
+	if (supportsPullDiagnostics) {
+		return connection.workspace.getConfiguration({ scopeUri: document.uri, section: '' });
+	}
+	const folder = workspaceFolders
+		.filter(item => document.uri.startsWith(item.uri.replace(/\/$/, '') + '/'))
+		.sort((a, b) => b.uri.length - a.uri.length)[0];
+	const configuration = clientCapabilities.workspace?.configuration === true
+		? await connection.workspace.getConfiguration({ scopeUri: document.uri, section: 'eslint' })
+		: undefined;
+	return { validate: Validate.probe, workspaceFolder: folder, ...initializationSettings, ...configuration };
+}
 
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
 // The notebooks manager is using the normal document manager for the cell documents.
@@ -150,10 +168,43 @@ function inferFilePath(documentOrUri: string | TextDocument | URI | undefined, u
 	return undefined;
 }
 
-ESLint.initialize(connection, documents, inferFilePath, loadNodeModule);
 SaveRuleConfigs.inferFilePath = inferFilePath;
 
+const pushDiagnostics = new PushDiagnostics(documents, async (document, reason) => {
+	const settings = await ESLint.resolveSettings(document);
+	if (reason === 'change' && settings.run === 'onSave') {
+		return undefined;
+	}
+	return (await validateDocument(document, settings)).items;
+}, params => {
+	// Some push clients do not track the optional diagnostic document version.
+	if (clientCapabilities.textDocument?.publishDiagnostics?.versionSupport !== true) {
+		delete params.version;
+	}
+	return connection.sendDiagnostics(params);
+}, error => connection.console.error(String(error)));
+
+documents.onDidOpen(event => {
+	if (!supportsPullDiagnostics) {
+		pushDiagnostics.schedule(event.document, 'open');
+	}
+});
+documents.onDidChangeContent(event => {
+	if (!supportsPullDiagnostics) {
+		pushDiagnostics.schedule(event.document, 'change');
+	}
+});
+documents.onDidSave(event => {
+	if (!supportsPullDiagnostics) {
+		pushDiagnostics.schedule(event.document, 'save');
+	}
+});
+connection.onShutdown(() => pushDiagnostics.dispose());
+
 documents.onDidClose(async (event) => {
+	if (!supportsPullDiagnostics) {
+		pushDiagnostics.close(event.document.uri);
+	}
 	const document = event.document;
 	const uri = document.uri;
 	ESLint.removeSettings(uri);
@@ -162,14 +213,24 @@ documents.onDidClose(async (event) => {
 	ESLint.unregisterAsFormatter(document);
 });
 
+/** Invalidate cached lint settings and revalidate open documents. */
 function environmentChanged() {
 	ESLint.clearSettings();
 	RuleSeverities.clear();
 	SaveRuleConfigs.clear();
 	ESLint.clearFormatters();
-	connection.languages.diagnostics.refresh().catch(() => {
-		connection.console.error('Failed to refresh diagnostics');
-	});
+	refreshDiagnostics();
+}
+
+/** Refresh only through a protocol supported by the client. */
+function refreshDiagnostics(): void {
+	if (!supportsPullDiagnostics) {
+		for (const document of documents.all()) {
+			pushDiagnostics.schedule(document, 'refresh');
+		}
+	} else if (clientCapabilities.workspace?.diagnostics?.refreshSupport === true) {
+		void connection.languages.diagnostics.refresh().catch(error => connection.console.error(String(error)));
+	}
 }
 
 namespace CommandIds {
@@ -186,6 +247,11 @@ connection.onInitialize((params, _cancel, progress) => {
 	progress.begin('Initializing ESLint Server');
 	const syncKind: TextDocumentSyncKind = TextDocumentSyncKind.Incremental;
 	clientCapabilities = params.capabilities;
+	supportsPullDiagnostics = clientCapabilities.textDocument?.diagnostic !== undefined;
+	workspaceFolders = params.workspaceFolders ?? (params.rootUri ? [{ uri: params.rootUri, name: path.basename(URI.parse(params.rootUri).fsPath) }] : []);
+	initializationSettings = params.initializationOptions?.eslint ?? {};
+	const dynamicFormatting = clientCapabilities.textDocument?.formatting?.dynamicRegistration === true;
+	ESLint.initialize(connection, documents, inferFilePath, loadNodeModule, getConfiguration, dynamicFormatting);
 	progress.done();
 	const capabilities: ServerCapabilities = {
 		textDocumentSync: {
@@ -211,13 +277,19 @@ connection.onInitialize((params, _cancel, progress) => {
 				CommandIds.applyDisableFile,
 				CommandIds.openRuleDoc,
 			]
-		},
-		diagnosticProvider: {
+		}
+	};
+	if (!dynamicFormatting) {
+		// Per-document settings still decide whether a formatting request produces edits.
+		capabilities.documentFormattingProvider = true;
+	}
+	if (supportsPullDiagnostics) {
+		capabilities.diagnosticProvider = {
 			identifier: 'eslint',
 			interFileDependencies: false,
 			workspaceDiagnostics: false
-		}
-	};
+		};
+	}
 
 	if (clientCapabilities.textDocument?.codeAction?.codeActionLiteralSupport?.codeActionKind.valueSet !== undefined) {
 		capabilities.codeActionProvider = {
@@ -229,15 +301,14 @@ connection.onInitialize((params, _cancel, progress) => {
 });
 
 connection.onInitialized(() => {
+	connection.onDidChangeConfiguration(() => environmentChanged());
 	if (clientCapabilities.workspace?.didChangeConfiguration?.dynamicRegistration === true) {
-		connection.onDidChangeConfiguration((_params) => {
-			environmentChanged();
-		});
 		void connection.client.register(DidChangeConfigurationNotification.type, undefined);
 	}
 
 	if (clientCapabilities.workspace?.workspaceFolders === true) {
-		connection.workspace.onDidChangeWorkspaceFolders((_params) => {
+		connection.workspace.onDidChangeWorkspaceFolders(({ removed, added }) => {
+			workspaceFolders = workspaceFolders.filter(folder => !removed.some(item => item.uri === folder.uri)).concat(added);
 			environmentChanged();
 		});
 	}
@@ -255,7 +326,11 @@ connection.languages.diagnostics.on(async (params) => {
 		return emptyDiagnosticResult;
 	}
 
-	const settings = await ESLint.resolveSettings(document);
+	return validateDocument(document, await ESLint.resolveSettings(document));
+});
+
+/** Run the shared validation and error handling for push and pull diagnostics. */
+async function validateDocument(document: TextDocument, settings: TextDocumentSettings): Promise<FullDocumentDiagnosticReport> {
 	if (settings.validate !== Validate.on || !TextDocumentSettings.hasLibrary(settings)) {
 		return emptyDiagnosticResult;
 	}
@@ -287,7 +362,7 @@ connection.languages.diagnostics.on(async (params) => {
 		}
 		return emptyDiagnosticResult;
 	}
-});
+}
 
 connection.onDidChangeWatchedFiles(async (params) => {
 	// A .eslintrc has change. No smartness here.
@@ -317,9 +392,7 @@ connection.onDidChangeWatchedFiles(async (params) => {
 			}
 		}
 	}));
-	connection.languages.diagnostics.refresh().catch(() => {
-		connection.console.error('Failed to refresh diagnostics');
-	});
+	refreshDiagnostics();
 });
 
 type RuleCodeActions = {
@@ -441,6 +514,38 @@ namespace CommandParams {
 
 const changes = new Changes();
 const ESLintSourceFixAll: string = `${CodeActionKind.SourceFixAll}.eslint`;
+
+/**
+ * Convert text-only workspace edits to the representation supported by the client.
+ * @param edit Internally versioned text edits; resource operations are not produced here.
+ * @returns Versioned edits or the legacy URI-to-edits map.
+ */
+function clientWorkspaceEdit(edit: WorkspaceEdit): WorkspaceEdit {
+	if (clientCapabilities.workspace?.workspaceEdit?.documentChanges === true) {
+		return edit;
+	}
+	const result: WorkspaceEdit = { changes: { ...edit.changes } };
+	for (const change of edit.documentChanges ?? []) {
+		if (TextDocumentEdit.is(change)) {
+			for (const textEdit of change.edits) {
+				if (!TextEdit.is(textEdit)) {
+					throw new Error('Unexpected snippet in ESLint workspace edit');
+				}
+				(result.changes![change.textDocument.uri] ??= []).push(textEdit);
+			}
+		}
+	}
+	return result;
+}
+
+/** Test intersection with a selection, treating an empty range as a cursor position. */
+function intersectsRange(diagnostic: Range, selection: Range): boolean {
+	const compare = (a: Position, b: Position) => a.line - b.line || a.character - b.character;
+	if (compare(selection.start, selection.end) === 0) {
+		return compare(diagnostic.start, selection.start) <= 0 && compare(selection.start, diagnostic.end) <= 0;
+	}
+	return compare(diagnostic.start, selection.end) < 0 && compare(selection.start, diagnostic.end) < 0;
+}
 
 connection.onCodeAction(async (params) => {
 	const result: CodeActionResult = new CodeActionResult();
@@ -595,7 +700,7 @@ connection.onCodeAction(async (params) => {
 			if (edits !== undefined) {
 				result.fixAll.push(CodeAction.create(
 					`Fix all fixable ESLint issues`,
-					{ documentChanges: [ TextDocumentEdit.create(textDocumentIdentifier, edits )]},
+					clientWorkspaceEdit({ documentChanges: [TextDocumentEdit.create(textDocumentIdentifier, edits)] }),
 					ESLintSourceFixAll
 				));
 			}
@@ -623,7 +728,14 @@ connection.onCodeAction(async (params) => {
 	const allFixableRuleIds: string[] = [];
 	const kind: CodeActionKind = only ?? CodeActionKind.QuickFix;
 
-	for (const editInfo of fixes.getScoped(params.context.diagnostics)) {
+	// Some clients send an empty diagnostic context even for a highlighted problem.
+	const scopedDiagnostics = params.context.diagnostics.length > 0 ? params.context.diagnostics : [...problems.values()]
+		.filter(problem => problem.documentVersion === textDocument.version && intersectsRange(problem.diagnostic.range, params.range))
+		.map(problem => problem.diagnostic);
+	for (const editInfo of fixes.getScoped(scopedDiagnostics)) {
+		if (editInfo.documentVersion !== textDocument.version) {
+			continue;
+		}
 		documentVersion = editInfo.documentVersion;
 		const ruleId = editInfo.ruleId;
 		allFixableRuleIds.push(ruleId);
@@ -689,7 +801,7 @@ connection.onCodeAction(async (params) => {
 			}
 		}
 
-		if (settings.codeAction.showDocumentation.enable && result.get(ruleId).showDocumentation === undefined) {
+		if ((supportsPullDiagnostics || clientCapabilities.window?.showDocument?.support === true) && settings.codeAction.showDocumentation.enable && result.get(ruleId).showDocumentation === undefined) {
 			if (RuleMetaData.hasRuleId(ruleId)) {
 				result.get(ruleId).showDocumentation = createCodeAction(
 					`Show documentation for ${ruleId}`,
@@ -819,7 +931,10 @@ async function computeAllFixes(identifier: VersionedTextDocumentIdentifier, mode
 
 connection.onExecuteCommand(async (params) => {
 	let workspaceChange: WorkspaceChange | undefined;
-	const commandParams: CommandParams = params.arguments![0] as CommandParams;
+	const commandParams = params.arguments?.[0] as CommandParams | undefined;
+	if (commandParams === undefined || documents.get(commandParams.uri)?.version !== commandParams.version) {
+		return null;
+	}
 	if (params.command === CommandIds.applyAllFixes) {
 		const edits = await computeAllFixes(commandParams, AllFixesMode.command);
 		if (edits !== undefined && edits.length > 0) {
@@ -835,7 +950,11 @@ connection.onExecuteCommand(async (params) => {
 		} else if (params.command === CommandIds.openRuleDoc && CommandParams.hasRuleId(commandParams)) {
 			const url = RuleMetaData.getUrl(commandParams.ruleId);
 			if (url) {
-				void connection.sendRequest(OpenESLintDocRequest.type, { url });
+				if (clientCapabilities.window?.showDocument?.support === true) {
+					void connection.window.showDocument({ uri: url, external: true });
+				} else {
+					void connection.sendRequest(OpenESLintDocRequest.type, { url }).catch(() => {});
+				}
 			}
 		} else {
 			workspaceChange = changes.get(params.command);
@@ -845,7 +964,14 @@ connection.onExecuteCommand(async (params) => {
 	if (workspaceChange === undefined) {
 		return null;
 	}
-	return connection.workspace.applyEdit(workspaceChange.edit).then((response) => {
+	// Legacy edits cannot carry a version: reject stale or cross-document cached fixes here.
+	for (const change of workspaceChange.edit.documentChanges ?? []) {
+		if (!TextDocumentEdit.is(change) || change.textDocument.uri !== commandParams.uri ||
+			change.textDocument.version !== commandParams.version || documents.get(commandParams.uri)?.version !== commandParams.version) {
+			return null;
+		}
+	}
+	return connection.workspace.applyEdit(clientWorkspaceEdit(workspaceChange.edit)).then((response) => {
 		if (!response.applied) {
 			connection.console.error(`Failed to apply command: ${params.command}`);
 		}

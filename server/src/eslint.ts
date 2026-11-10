@@ -867,6 +867,8 @@ export namespace CodeActions {
 export namespace ESLint {
 
 	let connection: ProposedFeatures.Connection;
+	let supportsFormattingRegistration = true;
+	let configurationProvider: ((document: TextDocument) => Promise<Partial<ConfigurationSettings> | null | undefined>) | undefined;
 	let documents: TextDocuments<TextDocument>;
 	let inferFilePath: (documentOrUri: string | TextDocument | URI | undefined, useRealpaths: boolean) => string | undefined;
 	let loadNodeModule: <T>(moduleName: string) => T | undefined;
@@ -977,7 +979,13 @@ export namespace ESLint {
 		};
 	}
 
-	export function initialize($connection: ProposedFeatures.Connection, $documents: TextDocuments<TextDocument>, $inferFilePath: (documentOrUri: string | TextDocument | URI | undefined, useRealpaths: boolean) => string | undefined, $loadNodeModule: <T>(moduleName: string) => T | undefined) {
+	/**
+	 * Bind server services and an optional per-document configuration provider.
+	 * Settings remain cached per resource by resolveSettings.
+	 */
+	export function initialize($connection: ProposedFeatures.Connection, $documents: TextDocuments<TextDocument>, $inferFilePath: (documentOrUri: string | TextDocument | URI | undefined, useRealpaths: boolean) => string | undefined, $loadNodeModule: <T>(moduleName: string) => T | undefined, $configurationProvider?: (document: TextDocument) => Promise<Partial<ConfigurationSettings> | null | undefined>, $supportsFormattingRegistration = true) {
+		supportsFormattingRegistration = $supportsFormattingRegistration;
+		configurationProvider = $configurationProvider;
 		connection = $connection;
 		documents = $documents;
 		inferFilePath = $inferFilePath;
@@ -1007,13 +1015,14 @@ export namespace ESLint {
 		formatterRegistrations.clear();
 	}
 
+	/** Resolve and cache the ESLint configuration and library for one document. */
 	export function resolveSettings(document: TextDocument): Promise<TextDocumentSettings> {
 		const uri = document.uri;
 		let resultPromise = document2Settings.get(uri);
 		if (resultPromise) {
 			return resultPromise;
 		}
-		resultPromise = connection.workspace.getConfiguration({ scopeUri: uri, section: '' }).then((configuration: ConfigurationSettings | null | undefined) => {
+		resultPromise = (configurationProvider ? configurationProvider(document) : connection.workspace.getConfiguration({ scopeUri: uri, section: '' })).then((configuration: Partial<ConfigurationSettings> | null | undefined) => {
 			const resolvedConfiguration = Object.assign(createDefaultConfigurationSettings(), configuration ?? {});
 			const settings: TextDocumentSettings = Object.assign(
 				{},
@@ -1237,12 +1246,12 @@ export namespace ESLint {
 					}
 					if (settings.validate === Validate.off) {
 						const params: ProbeFailedParams = { textDocument: { uri: document.uri } };
-						void connection.sendRequest(ProbeFailedRequest.type, params);
+						void connection.sendRequest(ProbeFailedRequest.type, params).catch(() => { /* Optional client extension. */ });
 					}
 				}
 				if (settings.validate === Validate.on) {
 					settings.silent = false;
-					if (settings.format && TextDocumentSettings.hasLibrary(settings) && !formatterRegistrations.has(uri)) {
+					if (supportsFormattingRegistration && settings.format && TextDocumentSettings.hasLibrary(settings) && !formatterRegistrations.has(uri)) {
 						const Uri = URI.parse(uri);
 						const isFile = Uri.scheme === 'file';
 						let pattern: string = isFile
@@ -1268,7 +1277,9 @@ export namespace ESLint {
 			}, () => {
 				settings.validate = Validate.off;
 				if (!settings.silent) {
-					void connection.sendRequest(NoESLintLibraryRequest.type, { source: { uri: document.uri } });
+					void connection.sendRequest(NoESLintLibraryRequest.type, { source: { uri: document.uri } }).catch(() => {
+						connection.console.error(`Unable to load ESLint for ${document.uri}`);
+					});
 				}
 				return settings;
 			});
@@ -1295,11 +1306,25 @@ export namespace ESLint {
 		return new library.ESLint(newOptions);
 	}
 
+	let classQueue: Promise<void> = Promise.resolve();
+
+	/**
+	 * Serialize ESLint operations because plugins can observe the process working directory.
+	 * Push validation runs outside the connection's request queue and can overlap code actions.
+	 * @param func Operation to run; must not recursively call withClass.
+	 * @param settings Resolved document settings and ESLint library.
+	 * @param options Optional ESLint option overrides.
+	 * @returns The operation's result after restoring the working directory.
+	 */
 	export async function withClass<T>(func: (eslintClass: ESLintClass) => Promise<T>, settings: TextDocumentSettings & { library: ESLintModule }, options?: ESLintClassOptions | CLIOptions): Promise<T> {
 		const newOptions: ESLintClassOptions | CLIOptions = options === undefined
 			? Object.assign(Object.create(null), settings.options)
 			: Object.assign(Object.create(null), settings.options, options);
 
+		const previous = classQueue;
+		let release!: () => void;
+		classQueue = new Promise<void>(resolve => { release = resolve; });
+		await previous;
 		const cwd = process.cwd();
 		try {
 			if (settings.workingDirectory) {
@@ -1317,8 +1342,12 @@ export namespace ESLint {
 			// finally block.
 			return await func(eslintClass);
 		} finally {
-			if (cwd !== process.cwd()) {
-				process.chdir(cwd);
+			try {
+				if (cwd !== process.cwd()) {
+					process.chdir(cwd);
+				}
+			} finally {
+				release();
 			}
 		}
 	}

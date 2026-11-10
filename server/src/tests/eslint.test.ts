@@ -68,3 +68,23 @@ void describe('ESLint settings', () => {
 		assert.strictEqual(settings.workingDirectory, undefined);
 	});
 });
+
+void it('serializes ESLint operations and releases the queue after a failure', async () => {
+	const events: string[] = [];
+	let release!: () => void;
+	const blocked = new Promise<void>(resolve => { release = resolve; });
+	const settings = { library: { ESLint: class {} }, options: {} } as any;
+	const first = ESLint.withClass(async () => {
+		events.push('first');
+		await blocked;
+		throw new Error('expected test error');
+	}, settings);
+	const rejected = assert.rejects(first, /expected test error/);
+	const second = ESLint.withClass(async () => { events.push('second'); return 42; }, settings);
+	await new Promise<void>(resolve => setImmediate(resolve));
+	assert.deepStrictEqual(events, ['first']);
+	release();
+	await rejected;
+	assert.strictEqual(await second, 42);
+	assert.deepStrictEqual(events, ['first', 'second']);
+});

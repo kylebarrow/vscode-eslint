@@ -1,5 +1,7 @@
 # VS Code ESLint extension
 
+This fork also supports standalone diagnostics, quick fixes and document formatting. See [BBEdit setup and testing](docs/bbedit.md).
+
 
 [![Build Status](https://dev.azure.com/vscode/vscode-eslint/_apis/build/status%2Fvscode-eslint?branchName=main)](https://dev.azure.com/vscode/vscode-eslint/_build?definitionId=51)
 

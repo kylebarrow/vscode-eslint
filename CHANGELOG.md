@@ -1,3 +1,11 @@
+### Unreleased — standalone editor support
+
+- Add capability-based push diagnostics for clients without pull-diagnostics support, including BBEdit.
+- Add per-document standalone configuration, debounced validation and stale-result protection.
+- Preserve pull diagnostics and respect diagnostic refresh/version capabilities.
+- Support empty-context quick fixes, legacy workspace edits and static document formatting for standalone clients.
+- Reject stale cached fix commands and omit unsupported rule-documentation actions.
+
 ### Version 3.0.34 - release
 
 - add support for bulk suppression (see new settings eslint.bulkSuppression.*)
